@@ -21,10 +21,7 @@ import static java.lang.System.out;
 import static java.util.Arrays.asList;
 import static java.util.Collections.emptyList;
 
-import java.io.BufferedReader;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -35,20 +32,21 @@ import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.avro.mapred.AvroInputFormat;
+import org.apache.avro.mapred.AvroOutputFormat;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.PathFilter;
+import org.apache.hadoop.fs.*;
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.SequenceFile.CompressionType;
@@ -56,6 +54,7 @@ import org.apache.hadoop.io.SequenceFile.Reader;
 import org.apache.hadoop.io.SequenceFile.Writer;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.compress.CompressionCodec;
+import org.apache.hadoop.io.compress.CompressionCodecFactory;
 import org.apache.hadoop.io.compress.DefaultCodec;
 import org.apache.hadoop.io.compress.GzipCodec;
 import org.apache.hadoop.mapred.Counters;
@@ -72,6 +71,7 @@ import org.apache.hadoop.mapred.TextInputFormat;
 import org.apache.hadoop.mapred.TextOutputFormat;
 import org.apache.hadoop.mapred.lib.IdentityMapper;
 import org.apache.hadoop.mapred.lib.MultipleInputs;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
@@ -190,6 +190,12 @@ public class Crush extends Configured implements Tool {
 	 */
 	private Verbosity console;
 
+    /**
+     *
+     * Variable to hold the string content of the schema file passed into the avro-schema option
+     */
+    private String avroSchema;
+
 	@SuppressWarnings("static-access")
 	Options buildOptions() {
 		Options options = new Options();
@@ -244,6 +250,15 @@ public class Crush extends Configured implements Tool {
 				.withDescription("Output format used to open the files of directories matching the corresponding regex")
 				.withLongOpt("output-format")
 				.create();
+
+        options.addOption(option);
+
+        option = OptionBuilder
+                .hasArg()
+                .withArgName("Avro Schema file")
+                .withDescription("HDFS file path to schema when using avro")
+                .withLongOpt("avro-schema")
+                .create();
 
 		options.addOption(option);
 
@@ -424,8 +439,14 @@ public class Crush extends Configured implements Tool {
 						inFormats = asList(TextInputFormat.class.getName());
 						outFormats = asList(TextOutputFormat.class.getName());
 
+					} else if (args[3].equals("AVRO")) {
+						/*
+						 * Let's try doing some Avro!
+						 */
+						inFormats = asList(AvroInputFormat.class.getName());
+						outFormats = asList(AvroOutputFormat.class.getName());
 					} else if (!args[3].equals("SEQUENCE")) {
-						throw new IllegalArgumentException("Type must be either TEXT or SEQUENCE: " + args[3]);
+						throw new IllegalArgumentException("Type must be either TEXT or SEQUENCE or AVRO: " + args[3]);
 					}
 				}
 			} else {
@@ -467,6 +488,11 @@ public class Crush extends Configured implements Tool {
 				if (cli.hasOption("output-format")) {
 					outFormats = asList(cli.getOptionValues("output-format"));
 				}
+
+                if (cli.hasOption("avro-schema")) {
+                    setAvroSchema(new Path(cli.getOptionValue("avro-schema")), getConf());
+                    job.set("avro.output.schema", avroSchema);
+                }
 
 				if (3 != nonOptions.length) {
 					throw new IllegalArgumentException("Could not find source directory, out directory, and job timestamp");
@@ -522,7 +548,9 @@ public class Crush extends Configured implements Tool {
 				inFmt = SequenceFileInputFormat.class.getName();
 			} else if ("text".equals(inFmt)) {
 				inFmt = TextInputFormat.class.getName();
-			} else {
+			} else if ("avro".equals(inFmt)) {
+                inFmt = AvroInputFormat.class.getName();
+            } else {
 				try {
 					if (!FileInputFormat.class.isAssignableFrom(Class.forName(inFmt))) {
 						throw new IllegalArgumentException("Not a FileInputFormat:" + inFmt);
@@ -540,7 +568,9 @@ public class Crush extends Configured implements Tool {
 				outFmt = SequenceFileOutputFormat.class.getName();
 			} else if ("text".equals(outFmt)) {
 				outFmt = TextOutputFormat.class.getName();
-			} else {
+			} else if ("avro".equals(outFmt)) {
+                outFmt = AvroOutputFormat.class.getName();
+            } else {
 				try {
 					if (!FileOutputFormat.class.isAssignableFrom(Class.forName(outFmt))) {
 						throw new IllegalArgumentException("Not a FileOutputFormat:" + outFmt);
@@ -1320,12 +1350,44 @@ public class Crush extends Configured implements Tool {
 		VERBOSE, INFO, NONE
 	}
 
+    /**
+     * Assign the contents of the passed schema file to the private var avroSchema.
+     *
+     * @param myLocation
+     * @param myConf
+     * @throws IOException
+     */
+    private void setAvroSchema(Path myLocation, Configuration myConf) throws IOException {
+        FileSystem myFileSystem = FileSystem.get(myLocation.toUri(), myConf);
+        CompressionCodecFactory myFactory = new CompressionCodecFactory(myConf);
+        CompressionCodec myCodec = myFactory.getCodec(myLocation);
+        InputStream myStream = null;
+        if (myCodec != null) {
+            myStream = myCodec.createInputStream(myFileSystem.open(myLocation));
+        } else {
+            myStream = myFileSystem.open(myLocation);
+        }
+        StringWriter myWriter = new StringWriter();
+        IOUtils.copy(myStream, myWriter, "UTF-8");
+        avroSchema = myWriter.toString();
+    }
+
 	public static void main(String[] args) throws Exception {
 
-    Configuration.addDefaultResource("hdfs-default.xml");
-    Configuration.addDefaultResource("hdfs-site.xml");
+        Configuration myConfiguration = new Configuration();
+        myConfiguration.addResource(new Path("/etc/hadoop/conf/hdfs-default.xml"));
+        myConfiguration.addResource(new Path("/etc/hadoop/conf/hdfs-site.xml"));
+        myConfiguration.addResource(new Path("/etc/hadoop/conf/core-site.xml"));
+        myConfiguration.addResource(new Path("/etc/hadoop/conf/mapred-site.xml"));
+        UserGroupInformation.setConfiguration(myConfiguration);
 
-		Crush crusher = new Crush();
+
+        /*FileSystem myFileSystem = FileSystem.get(myConfiguration);
+        Path myPath = new Path("/");
+        FileStatus[] myFileStatuses = myFileSystem.globStatus(myPath);
+        */
+        Crush crusher = new Crush();
+        crusher.setConf(myConfiguration);
 
 		int exitCode = ToolRunner.run(crusher, args);
 
